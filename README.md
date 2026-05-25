@@ -51,40 +51,88 @@
 
 ### 核心路径（逐笔成交 → K 线）
 
+完整调用链：
+
 ```
 Kafka PbTradeTick (protobuf)
   │
   ▼
-Kafka Consumer Worker Pool (config.parallel 个 goroutine)
-  │ protobuf.Unmarshal
-  │ NewTradeFromTick → Price/Quantity 转换为 int64 定点数 (decimal.D)
-  ▼
-Kline Aggregator (64 分片锁，不同 symbol 完全并行)
-  │ 1. 查询 shard[fnv32(symbol) % 64]
-  │ 2. 对 7 个 interval 更新 OHLCV 桶
-  │ 3. 窗口关闭的 K 线标记为 completed
-  ▼
-Async Flush Worker (buffered channel, 后台 goroutine)
-  │ BatchSave → REPLACE INTO t_kline_{symbol}
-  ▼
-TiDB
+Kafka Consumer Worker Pool (config.parallel 个 goroutine)     ← internal/kafka/consumer.go
+  │ proto.Unmarshal(data, &pb.PbTradeTick{})
+  │ NewTradeFromTick(tick) → Price/Quantity 转换为 int64 定点数 (decimal.D)
+  │
+  └→ c.handler(ctx, trade)        ← main.go 定义的 TradeHandler 闭包
+       │                            cmd/server/main.go:126
+       │
+       ├→ agg.ProcessTrade(ctx, trade)        ← internal/kline/aggregator.go
+       │    │
+       │    ├── shard[fnv32(symbol) % 64].Lock()    ← 64 分片锁，不同 symbol 完全并行
+       │    │    └── 首次则为该 symbol 执行 recoverLocked (从 TiDB 读 checkpoint)
+       │    │
+       │    ├── for 7 intervals (1m/10m/30m/1h/1w/1mon/1y):
+       │    │    ├── iv.AlignFn(t) 计算当前窗口起始时间
+       │    │    ├── cur.Update(price, qty, amount)  ← 更新 OHLCV
+       │    │    │    └── 纯 int64 定点数运算，零 heap alloc
+       │    │    └── 窗口关闭 ? → 标记为 completed kline
+       │    │
+       │    └── completed > 0 ?
+       │         └── flushWorker.Enqueue(symbol, klines)
+       │              └── 后台 goroutine 执行 BatchSave → TiDB (REPLACE INTO t_kline_{symbol})
+       │                   └── k.ComputeAvg()  ← 加权平均在 flush 时计算，非每笔
+       │
+       └→ hub.BroadcastTrade(trade)              ← internal/ws/hub.go
+            │
+            └── ensureBroadcaster(symbol) → per-symbol channel (buf 256)
+                 └── broadcastLoop goroutine (每个 symbol 独立)
+                      ├── json.Marshal(trade)   ← 一次 marshal，多连接共享
+                      └── for each subscriber:
+                           └── c.send <- buf    ← 慢消费者 drop，不阻塞
 ```
 
 ### WebSocket 推送
 
 ```
-Aggregator 处理完 trade
+前端订阅 → WS: {"action":"subscribe","symbol":"BTCUSDT"}
   │
-  ▼
-Hub.BroadcastTrade(trade)
-  │ trade → per-symbol channel
-  ▼
-broadcastLoop goroutine (每个 symbol 独立)
-  │ json.Marshal (只 marshal 一次)
-  │ for each subscriber: c.send <- buf
-  ▼
-WebSocket Connection
+  └→ hub.subscribe(conn, "BTCUSDT")             ← internal/ws/hub.go
+       │
+       └→ hub.subs["BTCUSDT"] = {conn1, conn2, ...}
+
+撮合引擎新成交 → Kafka → agg.ProcessTrade
+  │
+  └→ hub.BroadcastTrade(trade)
+       │
+       └→ trade → per-symbol chan("BTCUSDT")
+            │
+            └→ broadcastLoop goroutine (per-symbol, 独立 goroutine)
+                 ├── json.Marshal({"type":"trade","data":{...}})
+                 └── for each subscriber:
+                      ├── c.send <- buf (非阻塞)
+                      └── writePump → conn.ws.WriteMessage
 ```
+
+### 启动与恢复路径
+
+```
+服务启动 (cmd/server/main.go)
+  │
+  ├── db.Ping()
+  ├── agg.StartCheckpoint(ctx, 5s)              ← 每 5s 持久化 open bucket
+  ├── (可选) elect.Run(ctx)                      ← ZooKeeper 选主
+  ├── consumer.Run(ctx)                          ← 开始消费 Kafka
+  │
+  └── 首个 Trade 到达 symbol="BTCUSDT"
+       │
+       └── agg.recoverLocked(ctx, "BTCUSDT", t)  ← 查 DB 恢复 checkpoint
+            │
+            ├── LoadKline("BTCUSDT", "1m",  windowStart)
+            ├── LoadKline("BTCUSDT", "10m", windowStart)
+            ├── LoadKline("BTCUSDT", "30m", windowStart)
+            ├── LoadKline("BTCUSDT", "1h",  windowStart)
+            ├── LoadKline("BTCUSDT", "1w",  windowStart)
+            ├── LoadKline("BTCUSDT", "1mon",windowStart)
+            ├── LoadKline("BTCUSDT", "1y",  windowStart)
+            └── 命中任一 → 恢复为 bucket 初始状态；未命中 → 从零开始
 
 ---
 
@@ -146,7 +194,26 @@ reader goroutine → chan → worker 1
 
 ## 容错设计
 
-### 1. Periodic Checkpoint（防 Crash 丢失）
+### 1. 幂等消费（防重复处理）
+
+```
+Kafka message → proto.Unmarshal
+                  │
+                  ├── deduper.Seen(tradeID) == true → 跳过（重复消息）
+                  │
+                  └── deduper.Seen(tradeID) == false → 正常处理并记录 tradeID
+                       │
+                       └── 处理成功后 CommitMessages（at-least-once 交付）
+                            │
+                            └── 若 commit 失败，rebalance 后重新消费该消息
+                                 → dedup 拦截，不会重复计入 K 线
+```
+
+- 使用 ring buffer 记录最近 100 万条 TradeID（≈ 16MB，覆盖 ~5 分钟窗口）
+- 超出窗口的旧 ID 自动淘汰，不影响高频交易
+- 滑窗大小超过 Kafka rebalance 时间窗口，确保 rebalance 期间的重复消息被拦截
+
+### 2. Periodic Checkpoint（防 Crash 丢失）
 
 ```
 每 5 秒 → 遍历所有 shard → 收集非空 bucket → REPLACE INTO 写入 TiDB

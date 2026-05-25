@@ -17,18 +17,23 @@ import (
 type TradeHandler func(ctx context.Context, trade model.Trade) error
 
 // Consumer reads trade ticks from Kafka and dispatches them.
-// Multiple goroutines share the same reader for partitioned topics.
+// Uses at-least-once delivery + dedup for exactly-once semantics.
 type Consumer struct {
 	reader  *kafkago.Reader
 	handler TradeHandler
 	workers int
+	deduper *Deduper
 	wg      sync.WaitGroup
 }
 
+// task carries a message and its parsed form through the pipeline.
+type task struct {
+	msg   kafkago.Message
+	data  []byte
+}
+
 // NewConsumer creates a Consumer.
-//   - workers: number of goroutines sharing consumption (set >1 for partitioned topics).
-//     Internally this controls a goroutine pool: 1 reader goroutine fans out to
-//     N processor goroutines via a buffered channel.
+//   - workers: number of goroutines sharing consumption.
 func NewConsumer(cfg config.KafkaConfig, handler TradeHandler) *Consumer {
 	r := kafkago.NewReader(kafkago.ReaderConfig{
 		Brokers:     cfg.Brokers,
@@ -46,6 +51,7 @@ func NewConsumer(cfg config.KafkaConfig, handler TradeHandler) *Consumer {
 		reader:  r,
 		handler: handler,
 		workers: w,
+		deduper: NewDeduper(1_000_000), // ~16MB, ~5 min window
 	}
 }
 
@@ -54,7 +60,7 @@ func (c *Consumer) Run(ctx context.Context) error {
 	log.Printf("kafka consumer started: topic=%s group=%s workers=%d",
 		c.reader.Config().Topic, c.reader.Config().GroupID, c.workers)
 
-	tasks := make(chan []byte, c.workers*64)
+	tasks := make(chan task, c.workers*64)
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
@@ -64,7 +70,7 @@ func (c *Consumer) Run(ctx context.Context) error {
 		go c.worker(ctx, tasks, &c.wg)
 	}
 
-	// Reader goroutine: fetch messages, send to channel.
+	// Reader goroutine: fetch messages only — no commit.
 	fetchErr := make(chan error, 1)
 	go func() {
 		for {
@@ -74,13 +80,9 @@ func (c *Consumer) Run(ctx context.Context) error {
 				return
 			}
 			select {
-			case tasks <- msg.Value:
+			case tasks <- task{msg: msg, data: msg.Value}:
 			case <-ctx.Done():
 				return
-			}
-
-			if err := c.reader.CommitMessages(ctx, msg); err != nil {
-				log.Printf("commit error: %v", err)
 			}
 		}
 	}()
@@ -100,15 +102,25 @@ func (c *Consumer) Run(ctx context.Context) error {
 	}
 }
 
-func (c *Consumer) worker(ctx context.Context, tasks <-chan []byte, wg *sync.WaitGroup) {
+// worker pulls tasks from the channel, processes them, and commits.
+func (c *Consumer) worker(ctx context.Context, tasks <-chan task, wg *sync.WaitGroup) {
 	defer wg.Done()
 	for {
 		select {
 		case <-ctx.Done():
 			return
-		case data := <-tasks:
-			if err := c.process(data); err != nil {
+		case t := <-tasks:
+			shouldCommit := true
+
+			if err := c.process(t.data); err != nil {
 				log.Printf("process error: %v", err)
+				shouldCommit = false
+			}
+
+			if shouldCommit {
+				if err := c.reader.CommitMessages(ctx, t.msg); err != nil {
+					log.Printf("commit error (will retry on rebalance): %v", err)
+				}
 			}
 		}
 	}
@@ -119,6 +131,12 @@ func (c *Consumer) process(data []byte) error {
 	if err := proto.Unmarshal(data, tick); err != nil {
 		return err
 	}
+
+	// Idempotent check: skip known trade IDs.
+	if c.deduper.Seen(tick.TradeId) {
+		return nil
+	}
+
 	trade := model.NewTradeFromTick(tick)
 	return c.handler(context.Background(), trade)
 }
