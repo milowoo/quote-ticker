@@ -1,0 +1,21 @@
+server:
+  port: 8082
+
+kafka:
+  brokers:
+    - localhost:9092
+  topic: match-result
+  group_id: quote-ticker-group
+  parallel: 1
+
+database:
+  dsn: "root:@tcp(localhost:4000)/quote_ticker?charset=utf8mb4&parseTime=true&loc=UTC"
+
+zookeeper:
+  servers:
+    - localhost:2181
+  path: /quote-ticker/leader
+  enabled: false
+
+continuity:
+  check_interval: 10m

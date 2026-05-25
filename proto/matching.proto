@@ -1,0 +1,13 @@
+syntax = "proto3";
+package matching;
+
+option go_package = "quote-ticker/internal/model/pb";
+
+message PbTradeTick {
+  string symbol_id = 1;
+  int64 trade_id = 2;
+  string price = 3;
+  string quantity = 4;
+  int64 trade_time = 5;        // epoch millis
+  string taker_side = 6;       // BUY or SELL
+}

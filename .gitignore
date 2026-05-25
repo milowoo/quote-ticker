@@ -1,0 +1,41 @@
+# Binaries
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+cmd/server/server
+/server
+
+# Go build cache / vendor
+vendor/
+/go/pkg/
+
+# Test binary, built with `go test -c`
+*.test
+
+# Output of `go coverage`
+*.out
+*.prof
+coverage.txt
+coverage.html
+
+# IDE
+.idea/
+*.iml
+.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Environment
+.env
+.env.local
+.env.production
+
+# Config override
+config.local.yaml
+
+# Temp
+/tmp/
