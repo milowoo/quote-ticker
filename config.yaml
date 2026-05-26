@@ -11,9 +11,9 @@ kafka:
 database:
   dsn: "root:@tcp(localhost:4000)/quote_ticker?charset=utf8mb4&parseTime=true&loc=UTC"
 
-zookeeper:
+etcd:
   servers:
-    - localhost:2181
+    - localhost:2379
   path: /quote-ticker/leader
   enabled: false
 

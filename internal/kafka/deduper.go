@@ -1,44 +1,35 @@
 package kafka
 
-import "sync"
+import (
+	"strconv"
+	"time"
+
+	gocache "github.com/patrickmn/go-cache"
+)
 
 // Deduper prevents duplicate trade processing by tracking recent TradeIDs
-// in a sliding-window ring buffer. TradeIDs older than the buffer are
-// forgotten — this is safe because Kafka's at-least-once delivery combined
-// with the checkpoint/recovery mechanism bounds the duplicate window.
+// with a TTL-based cache. Entries expire after ttl — long enough to cover
+// Kafka rebalance windows but short enough to bound memory.
+//
+// go-cache handles all concurrency, eviction, and background cleanup.
 type Deduper struct {
-	mu     sync.Mutex
-	seen   map[int64]struct{}
-	queue  []int64
-	maxLen int
+	store *gocache.Cache
 }
 
-// NewDeduper creates a deduper that remembers up to maxLen trade IDs.
-// 1M entries ≈ 16 MB, enough for ~5 min of high-volume trading.
-func NewDeduper(maxLen int) *Deduper {
+// NewDeduper creates a deduper. Trade IDs are remembered for ttl duration.
+// 5 minutes is a safe default — exceeds typical Kafka rebalance time.
+func NewDeduper(ttl time.Duration) *Deduper {
 	return &Deduper{
-		seen:   make(map[int64]struct{}, maxLen),
-		queue:  make([]int64, 0, maxLen),
-		maxLen: maxLen,
+		store: gocache.New(ttl, ttl/2),
 	}
 }
 
 // Seen checks and records a trade ID. Returns true if already seen (duplicate).
 func (d *Deduper) Seen(tradeID int64) bool {
-	d.mu.Lock()
-	defer d.mu.Unlock()
-
-	if _, ok := d.seen[tradeID]; ok {
+	key := strconv.FormatInt(tradeID, 10)
+	if _, found := d.store.Get(key); found {
 		return true
 	}
-
-	d.seen[tradeID] = struct{}{}
-	d.queue = append(d.queue, tradeID)
-
-	if len(d.queue) > d.maxLen {
-		oldest := d.queue[0]
-		delete(d.seen, oldest)
-		d.queue = d.queue[1:]
-	}
+	d.store.Set(key, struct{}{}, gocache.DefaultExpiration)
 	return false
 }

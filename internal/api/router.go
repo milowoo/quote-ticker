@@ -3,6 +3,7 @@ package api
 import (
 	"net/http"
 
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"quote-ticker/internal/ws"
 )
 
@@ -16,6 +17,9 @@ func NewRouter(h *Handler, hub *ws.Hub) *Router {
 	// REST API - kline query
 	mux.HandleFunc("GET /api/klines", h.HandleQueryKlines)
 	mux.HandleFunc("GET /api/kline/{symbol}/{interval}", h.HandleGetKline)
+
+	// Prometheus metrics
+	mux.Handle("GET /metrics", promhttp.Handler())
 
 	// Health
 	mux.HandleFunc("GET /health", func(w http.ResponseWriter, r *http.Request) {

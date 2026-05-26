@@ -1,3 +1,6 @@
+// Package elector provides etcd-based leader election.
+// Uses etcd concurrency.Mutex with lease — the leader holds a lock key
+// that auto-expires if the instance dies. Failover takes ~TTL seconds.
 package elector
 
 import (
@@ -6,44 +9,46 @@ import (
 	"sync"
 	"time"
 
-	"github.com/go-zookeeper/zk"
+	clientv3 "go.etcd.io/etcd/client/v3"
+	"go.etcd.io/etcd/client/v3/concurrency"
 )
 
-// Elector manages ZooKeeper-based leader election.
-// All instances attempt to create the same ephemeral node;
-// only the successful one is leader. Others watch and retry.
+// Elector manages etcd-based leader election.
+// All instances attempt to acquire a distributed mutex on the same key;
+// the holder is the leader. If the leader's session expires (crash/network
+// partition), the lock is automatically released and a follower takes over.
 type Elector struct {
-	conn       *zk.Conn
-	leaderPath string
+	client     *clientv3.Client
+	key        string
 	instanceID string
 
-	mu       sync.RWMutex
-	isLeader bool
+	mu           sync.RWMutex
+	isLeader     bool
+	leaderCancel context.CancelFunc // cancels the onLeading context on step-down
 
 	onLeading   func(ctx context.Context)
 	onFollowing func()
-	cancel      context.CancelFunc
 }
 
-// New creates an Elector.
-//   - servers: ZooKeeper addresses (e.g. ["localhost:2181"])
-//   - path:    ZooKeeper node path (e.g. "/quote-ticker/leader")
-//   - onLeading:  called when this instance becomes leader
+// New creates an Elector backed by etcd.
+//   - servers: etcd endpoints (e.g. ["localhost:2379"])
+//   - key:     mutex key (e.g. "/quote-ticker/leader")
+//   - onLeading:  called with a leader-scoped context when this instance becomes leader
 //   - onFollowing: called when this instance becomes follower
-func New(servers []string, path string, instanceID string,
+func New(servers []string, key string, instanceID string,
 	onLeading func(ctx context.Context), onFollowing func()) (*Elector, error) {
 
-	conn, _, err := zk.Connect(servers, 5*time.Second)
+	cli, err := clientv3.New(clientv3.Config{
+		Endpoints:   servers,
+		DialTimeout: 5 * time.Second,
+	})
 	if err != nil {
 		return nil, err
 	}
 
-	// Ensure parent path exists.
-	ensurePath(conn, path)
-
 	return &Elector{
-		conn:        conn,
-		leaderPath:  path + "/node",
+		client:      cli,
+		key:         key,
 		instanceID:  instanceID,
 		onLeading:   onLeading,
 		onFollowing: onFollowing,
@@ -51,66 +56,77 @@ func New(servers []string, path string, instanceID string,
 }
 
 // Run starts the election loop. Blocks until ctx is cancelled.
+// Leadership changes are handled via callbacks.
 func (e *Elector) Run(ctx context.Context) {
-	ctx, e.cancel = context.WithCancel(ctx)
-	defer e.becomeFollower()
+	log.Printf("[elector] starting: key=%s instance=%s", e.key, e.instanceID)
 
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		default:
-			e.tryElect(ctx)
-			// Wait before retry, but also watch for node deletion.
-			select {
-			case <-ctx.Done():
-				return
-			case <-time.After(3 * time.Second):
-			}
 		}
+
+		e.tryLead(ctx)
 	}
 }
 
-func (e *Elector) tryElect(ctx context.Context) {
-	// Try to create the ephemeral leader node.
-	_, err := e.conn.Create(e.leaderPath,
-		[]byte(e.instanceID),
-		zk.FlagEphemeral,
-		zk.WorldACL(zk.PermAll),
+// tryLead attempts to acquire leadership via an etcd mutex.
+// - Creates a session with 5-second TTL (leader data auto-expires on crash)
+// - Blocks on mutex.Lock until this instance becomes the leader
+// - Then blocks until the session expires or ctx is cancelled
+func (e *Elector) tryLead(ctx context.Context) {
+	session, err := concurrency.NewSession(e.client,
+		concurrency.WithTTL(5),
+		concurrency.WithContext(ctx),
 	)
-	if err == nil {
-		e.becomeLeader(ctx)
+	if err != nil {
+		if ctx.Err() == nil {
+			log.Printf("[elector] session error: %v", err)
+			time.Sleep(time.Second)
+		}
 		return
 	}
+	defer session.Close()
 
-	// Node already exists — we are a follower.
-	e.becomeFollower()
+	mu := concurrency.NewMutex(session, e.key)
 
-	// Watch for node deletion to retry.
-	exists, _, ch, err := e.conn.ExistsW(e.leaderPath)
-	if err != nil || !exists {
-		// Node doesn't exist, retry immediately.
-		return
+	// Block until we acquire the mutex (become leader).
+	if err := mu.Lock(ctx); err != nil {
+		return // context cancelled
 	}
 
+	e.becomeLeader(ctx)
+
+	// Hold leadership until session dies or context is cancelled.
+	// becomeFollower is called INSIDE the select so the transition
+	// from leader→follower happens atomically with the session expiry
+	// detection.  Without this, a FGC-paused leader could resume, run
+	// more trades with isLeader still true, and cause a split-brain window.
 	select {
 	case <-ctx.Done():
-	case <-ch:
-		// Node deleted, will retry on next loop iteration.
+		e.becomeFollower()
+		mu.Unlock(context.Background())
+	case <-session.Done():
+		log.Printf("[elector] session expired — lost leadership")
+		e.becomeFollower()
 	}
 }
 
 func (e *Elector) becomeLeader(ctx context.Context) {
 	e.mu.Lock()
-	wasLeader := e.isLeader
+	if e.isLeader {
+		e.mu.Unlock()
+		return
+	}
 	e.isLeader = true
+	leaderCtx, leaderCancel := context.WithCancel(ctx)
+	e.leaderCancel = leaderCancel
 	e.mu.Unlock()
 
-	if !wasLeader {
-		log.Printf("[elector] become leader (instance=%s)", e.instanceID)
-		if e.onLeading != nil {
-			go e.onLeading(ctx)
-		}
+	log.Printf("[elector] become leader (instance=%s)", e.instanceID)
+	if e.onLeading != nil {
+		go e.onLeading(leaderCtx)
 	}
 }
 
@@ -118,6 +134,10 @@ func (e *Elector) becomeFollower() {
 	e.mu.Lock()
 	wasLeader := e.isLeader
 	e.isLeader = false
+	if e.leaderCancel != nil {
+		e.leaderCancel()
+		e.leaderCancel = nil
+	}
 	e.mu.Unlock()
 
 	if wasLeader {
@@ -128,45 +148,16 @@ func (e *Elector) becomeFollower() {
 	}
 }
 
-// IsLeader returns true if this instance is the current leader.
+// IsLeader returns true if this instance holds the leader lock.
 func (e *Elector) IsLeader() bool {
 	e.mu.RLock()
 	defer e.mu.RUnlock()
 	return e.isLeader
 }
 
-// Close releases the ZooKeeper connection and removes the ephemeral node.
+// Close releases the etcd connection.
 func (e *Elector) Close() {
-	if e.cancel != nil {
-		e.cancel()
+	if e.client != nil {
+		e.client.Close()
 	}
-	e.conn.Delete(e.leaderPath, -1)
-	e.conn.Close()
-}
-
-func ensurePath(conn *zk.Conn, path string) {
-	parts := splitPath(path)
-	cur := ""
-	for _, p := range parts {
-		cur += "/" + p
-		exists, _, err := conn.Exists(cur)
-		if err != nil || !exists {
-			conn.Create(cur, nil, 0, zk.WorldACL(zk.PermAll))
-		}
-	}
-}
-
-func splitPath(path string) []string {
-	var parts []string
-	start := 0
-	for i := 0; i < len(path); i++ {
-		if path[i] == '/' && i > start {
-			parts = append(parts, path[start:i])
-			start = i + 1
-		}
-	}
-	if start < len(path) {
-		parts = append(parts, path[start:])
-	}
-	return parts
 }

@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/gorilla/websocket"
+	"quote-ticker/internal/metrics"
 	"quote-ticker/internal/model"
 )
 
@@ -120,10 +121,15 @@ func (h *Hub) HandleWS(w http.ResponseWriter, r *http.Request) {
 
 	h.mu.Lock()
 	h.conns[c] = true
+	metrics.WSConnections.Set(float64(len(h.conns)))
 	h.mu.Unlock()
 
 	go c.writePump()
 	c.readPump()
+
+	h.mu.Lock()
+	metrics.WSConnections.Set(float64(len(h.conns)))
+	h.mu.Unlock()
 }
 
 func (h *Hub) subscribe(c *conn, symbol string) {
@@ -134,6 +140,7 @@ func (h *Hub) subscribe(c *conn, symbol string) {
 	}
 	h.subs[symbol][c] = true
 	c.subbed[symbol] = true
+	metrics.WSSubscriptions.WithLabelValues(symbol).Set(float64(len(h.subs[symbol])))
 }
 
 func (h *Hub) unsubscribe(c *conn, symbol string) {
@@ -143,7 +150,10 @@ func (h *Hub) unsubscribe(c *conn, symbol string) {
 		delete(subs, c)
 		if len(subs) == 0 {
 			delete(h.subs, symbol)
+			metrics.WSSubscriptions.DeleteLabelValues(symbol)
+			return
 		}
+		metrics.WSSubscriptions.WithLabelValues(symbol).Set(float64(len(subs)))
 	}
 	delete(c.subbed, symbol)
 }

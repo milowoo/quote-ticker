@@ -5,19 +5,30 @@ import (
 	"database/sql"
 	"fmt"
 	"strings"
+	"time"
 
 	"quote-ticker/internal/decimal"
 	"quote-ticker/internal/model"
 )
 
-// KlineRepo implements kline.Repository backed by TiDB.
+// KlineRepo implements kline.Repository backed by TiDB + in-memory cache.
 type KlineRepo struct {
-	db *sql.DB
-	tm *TableManager
+	db    *sql.DB
+	tm    *TableManager
+	cache *klineCache
 }
 
-func NewKlineRepo(db *sql.DB, tm *TableManager) (*KlineRepo, error) {
-	return &KlineRepo{db: db, tm: tm}, nil
+// NewKlineRepo creates a KlineRepo.
+//   - maxCacheItems: max recent klines per (symbol, interval) key
+//   - intervalTTL:     per-interval TTL overrides, e.g. {"1m": 2*time.Second}
+//   - defaultCacheTTL: fallback TTL for intervals not in intervalTTL
+func NewKlineRepo(db *sql.DB, tm *TableManager, maxCacheItems int,
+	intervalTTL map[string]time.Duration, defaultCacheTTL time.Duration) (*KlineRepo, error) {
+	return &KlineRepo{
+		db:    db,
+		tm:    tm,
+		cache: newKlineCache(maxCacheItems, intervalTTL, defaultCacheTTL),
+	}, nil
 }
 
 // BatchSave persists klines using REPLACE (upsert) semantics.
@@ -61,7 +72,21 @@ func (r *KlineRepo) BatchSave(ctx context.Context, symbol string, klines []*mode
 		}
 	}
 
-	return tx.Commit()
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+
+	// Warm cache with the newly written klines.
+	// Group by interval so each (symbol, interval) pair stores contiguous records.
+	byInterval := make(map[string][]*model.Kline)
+	for _, k := range klines {
+		byInterval[k.Interval] = append(byInterval[k.Interval], k)
+	}
+	for iv, group := range byInterval {
+		r.cache.put(symbol, iv, group)
+	}
+
+	return nil
 }
 
 // LoadKline retrieves a single kline by interval + startTime (PK lookup).
@@ -105,9 +130,17 @@ func (r *KlineRepo) LoadKline(ctx context.Context, symbol, interval string, star
 }
 
 // Query retrieves historical klines for a symbol + interval + time range.
+// Cache hit → returns from memory (sub-microsecond).
+// Cache miss → queries TiDB and warms the cache.
 func (r *KlineRepo) Query(ctx context.Context, symbol, interval string,
 	startTime, endTime int64, limit int) ([]*model.Kline, error) {
 
+	// Fast path: return from cache if available.
+	if cached := r.cache.get(symbol, interval, startTime, endTime, limit); cached != nil {
+		return cached, nil
+	}
+
+	// Slow path: query TiDB.
 	tableName := TableName(symbol)
 	rows, err := r.db.QueryContext(ctx, fmt.Sprintf(`
 		SELECT iv,st,ct,o,h,l,c,v,q,n,bv,bq,wavg
@@ -148,6 +181,12 @@ func (r *KlineRepo) Query(ctx context.Context, symbol, interval string,
 		k.WeightedAvg = parseDec(wavgS)
 		out = append(out, k)
 	}
+
+	// Warm cache with query results.
+	if len(out) > 0 {
+		r.cache.put(symbol, interval, out)
+	}
+
 	return out, rows.Err()
 }
 

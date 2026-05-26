@@ -16,6 +16,7 @@ import (
 	"quote-ticker/internal/elector"
 	"quote-ticker/internal/kafka"
 	"quote-ticker/internal/kline"
+	"quote-ticker/internal/metrics"
 	"quote-ticker/internal/model"
 	"quote-ticker/internal/repository"
 	"quote-ticker/internal/ws"
@@ -62,17 +63,16 @@ func main() {
 
 	// --- Repository ---
 	tm := repository.NewTableManager(db)
-	repo, err := repository.NewKlineRepo(db, tm)
+	intervalTTL := map[string]time.Duration{
+		"1m": 2 * time.Second,
+	}
+	repo, err := repository.NewKlineRepo(db, tm, 500, intervalTTL, 5*time.Second)
 	if err != nil {
 		log.Fatalf("new repo: %v", err)
 	}
 
-	// --- Async flush worker (decouples DB writes from trade processing) ---
-	flushWorker := kline.NewFlushWorker(repo, 10000)
-
 	// --- Kline Aggregator ---
 	agg := kline.NewAggregator(repo)
-	agg.SetFlushWorker(flushWorker)
 
 	// --- WebSocket Hub ---
 	hub := ws.NewHub()
@@ -81,8 +81,8 @@ func main() {
 	var elect *elector.Elector
 	leaderFn := func() bool { return true } // default: always leader (single instance)
 
-	if cfg.ZooKeeper.Enabled {
-		log.Printf("connecting to ZooKeeper: %v", cfg.ZooKeeper.Servers)
+	if cfg.Etcd.Enabled {
+		log.Printf("connecting to etcd: %v", cfg.Etcd.Servers)
 
 		instanceID, _ := os.Hostname()
 		if instanceID == "" {
@@ -90,17 +90,16 @@ func main() {
 		}
 
 		elect, err = elector.New(
-			cfg.ZooKeeper.Servers,
-			cfg.ZooKeeper.Path,
+			cfg.Etcd.Servers,
+			cfg.Etcd.Path,
 			instanceID,
 			func(ctx context.Context) {
 				log.Println("[leader] start leading — DB writes enabled")
-				// Continuity check runs on leader only.
 				contInterval, _ := time.ParseDuration(cfg.Continuity.CheckInterval)
 				if contInterval <= 0 {
 					contInterval = 10 * time.Minute
 				}
-				go kline.NewContinuityChecker(repo, tm, elect.IsLeader).Run(ctx, contInterval)
+				go kline.NewContinuityChecker(repo, agg.DrainDirty, elect.IsLeader).Run(ctx, contInterval)
 			},
 			func() {
 				log.Println("[leader] stop leading — DB writes disabled")
@@ -113,14 +112,26 @@ func main() {
 		leaderFn = elect.IsLeader
 		agg.SetLeaderChecker(leaderFn)
 
+		go func() {
+			for {
+				v := float64(0)
+				if elect.IsLeader() {
+					v = 1
+				}
+				metrics.Leader.Set(v)
+				time.Sleep(5 * time.Second)
+			}
+		}()
+
 		go elect.Run(ctx)
 		log.Println("leader election started, waiting for leadership...")
 	} else {
+		metrics.Leader.Set(1)
 		log.Println("leader election disabled — single-instance mode")
 	}
 
 	// --- Start checkpoint only if leader check passes.
-	agg.StartCheckpoint(ctx, 5*time.Second)
+	agg.StartCheckpoint(ctx, 500*time.Millisecond)
 
 	// --- Trade handler (dispatches to aggregator + WebSocket) ---
 	tradeHandler := func(ctx context.Context, trade model.Trade) error {
@@ -169,7 +180,6 @@ func main() {
 	defer shutdownCancel()
 
 	consumer.Close()
-	flushWorker.Close()
 	agg.Close(shutdownCtx)
 	httpServer.Shutdown(shutdownCtx)
 	if elect != nil {

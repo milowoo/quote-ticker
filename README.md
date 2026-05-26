@@ -39,7 +39,7 @@
 │  └─────────────────────────────────────────┘                │
 │                                                              │
 │  ┌─────────────────────────────────────────┐                │
-│  │          ZooKeeper Elector               │                │
+│  │          etcd Elector                    │                │
 │  │  (多实例选主，单实例可关闭)                │                │
 │  └─────────────────────────────────────────┘                │
 └─────────────────────────────────────────────────────────────┘
@@ -118,7 +118,7 @@ Kafka Consumer Worker Pool (config.parallel 个 goroutine)     ← internal/kafk
   │
   ├── db.Ping()
   ├── agg.StartCheckpoint(ctx, 5s)              ← 每 5s 持久化 open bucket
-  ├── (可选) elect.Run(ctx)                      ← ZooKeeper 选主
+  ├── (可选) elect.Run(ctx)                      ← etcd 选主
   ├── consumer.Run(ctx)                          ← 开始消费 Kafka
   │
   └── 首个 Trade 到达 symbol="BTCUSDT"
@@ -265,14 +265,16 @@ Leader 实例上每 10 分钟运行：
 
 ## 高可用设计
 
-### ZooKeeper Leader Election
+### etcd Leader Election
 
-多实例部署下，通过 ZooKeeper 临时节点选主：
+多实例部署下，通过 etcd `concurrency.Mutex` 选主：
 
 ```
-所有实例 → 尝试 create ephemeral /quote-ticker/leader/node
-   ├── 成功 = Leader → 写 DB + Continuity Check
-   └── 失败 = Follower → 仅消费 + WS 推送
+所有实例 → 对 /quote-ticker/leader 争夺分布式锁
+   ├── 持有锁 = Leader → 写 DB + Continuity Check
+   │                   ← 5s lease，异常断开后自动释放
+   └── 未持有 = Follower → 仅消费 + WS 推送
+                           ← mutex.Lock() 阻塞等待，锁释放后立即抢锁
 ```
 
 | 角色 | Kafka 消费 | WS 推送 | DB 写入 | Checkpoint | Continuity |
@@ -281,13 +283,14 @@ Leader 实例上每 10 分钟运行：
 | Follower | ✅ | ✅ | ❌ | ❌ | ❌ |
 
 Leader 切换时：
+- etcd session lease TTL = 5s（Leader crash 后最多 5s 完成切换）
 - 新 Leader 的首个 Trade 自动触发 `recoverLocked`，从 DB 恢复 checkpoint
-- 旧 Leader 的 ZooKeeper ephemeral 节点自动释放
+- 旧 Leader 的 etcd lease 自动过期，锁被释放
 
 ### 单实例模式
 
 ```yaml
-zookeeper:
+etcd:
   enabled: false    # 默认关闭，退化单实例
 ```
 
@@ -353,6 +356,7 @@ CREATE TABLE IF NOT EXISTS t_kline_btcusdt (
 | GET | `/api/klines?symbol=X&interval=X&startTime=&endTime=&limit=` | 查询 K 线 |
 | GET | `/api/kline/{symbol}/{interval}?startTime=&endTime=&limit=` | 同上（path 风格） |
 | GET | `/health` | 健康检查 |
+| GET | `/metrics` | Prometheus 监控指标 |
 | WS | `/ws` | WebSocket |
 
 ### WebSocket 订阅
@@ -384,15 +388,58 @@ kafka:
 database:
   dsn: "root:@tcp(localhost:4000)/quote_ticker?charset=utf8mb4&parseTime=true&loc=UTC"
 
-zookeeper:
+etcd:
   servers:
-    - localhost:2181
+    - localhost:2379
   path: /quote-ticker/leader
   enabled: false                 # 多实例时改为 true
 
 continuity:
   check_interval: 10m
 ```
+
+---
+
+## 监控指标
+
+`GET /metrics` 暴露 Prometheus 格式的指标，包含：
+
+### 业务指标
+
+| 指标 | 类型 | 标签 | 说明 |
+|------|------|------|------|
+| `quote_ticker_kafka_messages_total` | Counter | `status` (received/processed/deduped/error) | Kafka 消息处理计数 |
+| `quote_ticker_kafka_processing_duration_seconds` | Histogram | — | 单条消息处理耗时（1µs~16ms） |
+| `quote_ticker_trades_total` | Counter | `symbol` | 各交易对接收的成交笔数 |
+| `quote_ticker_klines_written_total` | Counter | `interval` | 写入 DB 的 K 线数 |
+| `quote_ticker_processing_duration_seconds` | Histogram | `symbol` | 单笔成交多 interval 更新耗时（1µs~16ms） |
+| `quote_ticker_open_buckets` | Gauge | `symbol`, `interval` | 当前内存中 open bucket 的 trade 数 |
+| `quote_ticker_ws_connections` | Gauge | — | 当前 WebSocket 连接数 |
+| `quote_ticker_ws_subscriptions` | Gauge | `symbol` | 各交易对订阅数 |
+| `quote_ticker_leader` | Gauge | — | 1=Leader, 0=Follower |
+| `quote_ticker_checkpoint_duration_seconds` | Histogram | — | 一次 checkpoint flush 耗时（100µs~1.6s） |
+| `quote_ticker_checkpoint_klines` | Summary | — | 每次 checkpoint 写入的 kline 数 |
+
+### Go Runtime 指标（prometheus/client_golang 内置）
+
+| 指标 | 说明 |
+|------|------|
+| `go_goroutines` | Goroutine 数量 |
+| `go_memstats_alloc_bytes` | 当前堆分配 |
+| `go_memstats_heap_objects` | 堆对象数 |
+| `go_gc_duration_seconds` | GC 暂停耗时 |
+| `process_cpu_seconds_total` | 进程 CPU 时间 |
+| `process_resident_memory_bytes` | 常驻内存 RSS |
+
+### 告警建议
+
+| 条件 | 说明 |
+|------|------|
+| `rate(kafka_messages_total{status="error"}[5m]) > 0` | Kafka 消费异常 |
+| `leader == 0` | 无 Leader（etcd 模式） |
+| `go_goroutines > 50000` | Goroutine 泄漏 |
+| `process_resident_memory_bytes > 2e9` | 内存超过 2GB |
+| `rate(checkpoint_duration_seconds_sum[5m]) / rate(checkpoint_duration_seconds_count[5m]) > 1` | Checkpoint 写入过慢 |
 
 ---
 
@@ -418,7 +465,7 @@ continuity:
 │   │   ├── table_manager.go        # 自动建表
 │   │   └── kline_repo.go          # TiDB 读写
 │   ├── kafka/consumer.go           # Kafka 消费 (protobuf)
-│   ├── elector/elector.go          # ZooKeeper 选主
+│   ├── elector/elector.go          # etcd 选主
 │   ├── ws/hub.go                   # WebSocket 推送
 │   └── api/
 │       ├── handler.go              # HTTP 查询

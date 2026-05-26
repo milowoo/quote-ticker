@@ -10,7 +10,7 @@ type Config struct {
 	Server     ServerConfig     `yaml:"server"`
 	Kafka      KafkaConfig      `yaml:"kafka"`
 	Database   DatabaseConfig   `yaml:"database"`
-	ZooKeeper  ZooKeeperConfig  `yaml:"zookeeper"`
+	Etcd       EtcdConfig       `yaml:"etcd"`
 	Continuity ContinuityConfig `yaml:"continuity"`
 }
 
@@ -29,7 +29,7 @@ type DatabaseConfig struct {
 	DSN string `yaml:"dsn"`
 }
 
-type ZooKeeperConfig struct {
+type EtcdConfig struct {
 	Enabled bool     `yaml:"enabled"`
 	Servers []string `yaml:"servers"`
 	Path    string   `yaml:"path"`
@@ -63,9 +63,9 @@ func Default() *Config {
 		Database: DatabaseConfig{
 			DSN: "root:@tcp(localhost:4000)/quote_ticker?charset=utf8mb4&parseTime=true&loc=UTC",
 		},
-		ZooKeeper: ZooKeeperConfig{
+		Etcd: EtcdConfig{
 			Enabled: false,
-			Servers: []string{"localhost:2181"},
+			Servers: []string{"localhost:2379"},
 			Path:    "/quote-ticker/leader",
 		},
 		Continuity: ContinuityConfig{

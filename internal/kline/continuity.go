@@ -4,30 +4,37 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"sync"
 	"time"
 
 	"quote-ticker/internal/model"
 )
 
+const continuityWorkers = 8 // parallel check goroutines
+
 // ContinuityChecker periodically verifies kline data integrity and backfills
 // missing longer-interval klines from 1m data.
+//
+// Optimizations:
+//   - Only checks symbols that received trades since last check (DrainDirty)
+//   - Parallel checking across symbols (8 workers)
+//   - Scans only the last N klines, not full time ranges
 type ContinuityChecker struct {
-	repo     Repository
-	symbols  SymbolLister
-	isLeader func() bool
-}
-
-// SymbolLister discovers symbols that have kline tables.
-type SymbolLister interface {
-	ListSymbols(ctx context.Context) ([]string, error)
+	repo        Repository
+	drainDirty  func() []string
+	isLeader    func() bool
+	checkWindow int // number of recent klines to check per interval
 }
 
 // NewContinuityChecker creates a continuity checker.
-func NewContinuityChecker(repo Repository, symbols SymbolLister, leaderFn func() bool) *ContinuityChecker {
+//   - drainDirty: returns symbols that have new trades since last call
+//   - checkWindow: number of recent klines to validate per interval (default 10)
+func NewContinuityChecker(repo Repository, drainDirty func() []string, leaderFn func() bool) *ContinuityChecker {
 	return &ContinuityChecker{
-		repo:     repo,
-		symbols:  symbols,
-		isLeader: leaderFn,
+		repo:       repo,
+		drainDirty: drainDirty,
+		isLeader:   leaderFn,
+		checkWindow: 10,
 	}
 }
 
@@ -53,34 +60,62 @@ func (c *ContinuityChecker) runOnce(ctx context.Context) {
 		return
 	}
 
-	symbols, err := c.symbols.ListSymbols(ctx)
-	if err != nil {
-		log.Printf("continuity: list symbols error: %v", err)
+	symbols := c.drainDirty()
+	if len(symbols) == 0 {
 		return
 	}
-	log.Printf("continuity: checking %d symbols", len(symbols))
 
-	now := time.Now().UnixMilli()
+	if c.checkWindow <= 0 {
+		c.checkWindow = 10
+	}
+
+	log.Printf("continuity: checking %d active symbols (parallel=%d)", len(symbols), continuityWorkers)
+
+	// Parallel check with bounded goroutines.
+	symCh := make(chan string, len(symbols))
 	for _, sym := range symbols {
+		symCh <- sym
+	}
+	close(symCh)
+
+	var wg sync.WaitGroup
+	wg.Add(continuityWorkers)
+	for i := 0; i < continuityWorkers; i++ {
+		go c.checkWorker(ctx, symCh, &wg)
+	}
+	wg.Wait()
+}
+
+func (c *ContinuityChecker) checkWorker(ctx context.Context, symCh <-chan string, wg *sync.WaitGroup) {
+	defer wg.Done()
+	for sym := range symCh {
 		select {
 		case <-ctx.Done():
 			return
 		default:
 		}
+		c.checkSymbol(ctx, sym)
+	}
+}
 
-		if err := c.checkInterval(ctx, sym, "1m", now-3600_000, now); err != nil {
-			log.Printf("continuity: %s 1m: %v", sym, err)
-		}
-		for _, iv := range []string{"10m", "30m", "1h"} {
-			if err := c.checkAndBackfill(ctx, sym, iv, now-24*3600_000, now); err != nil {
-				log.Printf("continuity: %s %s: %v", iv, sym, err)
-			}
+func (c *ContinuityChecker) checkSymbol(ctx context.Context, symbol string) {
+	// Check 1m klines — only the last checkWindow records.
+	if err := c.checkInterval(ctx, symbol, "1m"); err != nil {
+		log.Printf("continuity: %s 1m: %v", symbol, err)
+	}
+
+	// Longer intervals — check last checkWindow and backfill from 1m cache/DB.
+	for _, iv := range []string{"10m", "30m", "1h"} {
+		if err := c.checkAndBackfill(ctx, symbol, iv); err != nil {
+			log.Printf("continuity: %s %s: %v", iv, symbol, err)
 		}
 	}
 }
 
-func (c *ContinuityChecker) checkInterval(ctx context.Context, symbol, interval string, from, to int64) error {
-	klines, err := c.repo.Query(ctx, symbol, interval, from, to, 2000)
+// checkInterval fetches the last checkWindow klines and verifies no gaps.
+func (c *ContinuityChecker) checkInterval(ctx context.Context, symbol, interval string) error {
+	// Fetch a bit more than checkWindow to account for partial windows.
+	klines, err := c.repo.Query(ctx, symbol, interval, 0, time.Now().UnixMilli(), c.checkWindow*2)
 	if err != nil {
 		return err
 	}
@@ -88,23 +123,33 @@ func (c *ContinuityChecker) checkInterval(ctx context.Context, symbol, interval 
 		return nil
 	}
 
-	var gapFound bool
+	// Take only the last checkWindow.
+	if len(klines) > c.checkWindow {
+		klines = klines[len(klines)-c.checkWindow:]
+	}
+
 	ivDef, _ := Lookup(interval)
+	var gapFound bool
 	for i := 1; i < len(klines); i++ {
 		expected := klines[i-1].StartTime + intervalMs(ivDef, klines[i-1].StartTime)
 		if klines[i].StartTime != expected {
-			log.Printf("continuity GAP: %s %s missing window start=%d", symbol, interval, expected)
+			log.Printf("continuity GAP: %s %s missing window start=%d (prev=%d, cur=%d)",
+				symbol, interval, expected, klines[i-1].StartTime, klines[i].StartTime)
 			gapFound = true
 		}
 	}
 	if gapFound {
-		log.Printf("continuity: %s %s has gaps in [%d, %d]", symbol, interval, from, to)
+		log.Printf("continuity: %s %s has gaps — will attempt backfill", symbol, interval)
 	}
 	return nil
 }
 
-func (c *ContinuityChecker) checkAndBackfill(ctx context.Context, symbol, interval string, from, to int64) error {
-	klines, err := c.repo.Query(ctx, symbol, interval, from, to, 2000)
+// checkAndBackfill verifies the last checkWindow klines and reconstructs
+// any missing windows from 1m data.
+func (c *ContinuityChecker) checkAndBackfill(ctx context.Context, symbol, interval string) error {
+	now := time.Now().UnixMilli()
+
+	klines, err := c.repo.Query(ctx, symbol, interval, 0, now, c.checkWindow*2)
 	if err != nil {
 		return err
 	}
@@ -114,21 +159,25 @@ func (c *ContinuityChecker) checkAndBackfill(ctx context.Context, symbol, interv
 		return fmt.Errorf("unknown interval: %s", interval)
 	}
 
+	// Build a set of existing start_times.
 	existing := make(map[int64]bool, len(klines))
 	for _, k := range klines {
 		existing[k.StartTime] = true
 	}
 
-	t := time.UnixMilli(from).UTC()
-	end := time.UnixMilli(to).UTC()
+	// Scan backward from now, checking each expected window.
 	var missing []int64
+	t := time.UnixMilli(now).UTC()
+	checked := 0
 
-	for t.Before(end) {
+	for checked < c.checkWindow {
 		startMs := ivDef.AlignFn(t).UnixMilli()
 		if !existing[startMs] {
 			missing = append(missing, startMs)
 		}
-		t = time.UnixMilli(startMs + intervalMs(ivDef, startMs)).UTC()
+		// Move backward.
+		t = time.UnixMilli(startMs - 1).UTC()
+		checked++
 	}
 
 	if len(missing) == 0 {

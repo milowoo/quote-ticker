@@ -2,11 +2,11 @@ package kline
 
 import (
 	"context"
-	"hash/fnv"
 	"log"
 	"sync"
 	"time"
 
+	"quote-ticker/internal/metrics"
 	"quote-ticker/internal/model"
 )
 
@@ -17,23 +17,12 @@ type Repository interface {
 	Query(ctx context.Context, symbol, interval string, startTime, endTime int64, limit int) ([]*model.Kline, error)
 }
 
-const numShards = 64
-
-// shard holds a portion of the symbol→buckets map with its own lock.
-type shard struct {
-	mu      sync.Mutex
-	buckets map[string]*symbolBuckets
-}
-
-func newShard() *shard {
-	return &shard{buckets: make(map[string]*symbolBuckets)}
-}
-
-// symbolBuckets holds all interval buckets for one symbol.
+// symbolBuckets holds all interval buckets for one symbol, with its own mutex.
+// Two symbols NEVER share a lock — zero contention regardless of hash collisions.
 type symbolBuckets struct {
 	mu     sync.Mutex
 	symbol string
-	data   map[string]*model.Kline // interval -> open kline
+	data   map[string]*model.Kline // interval → open kline
 }
 
 func newSymbolBuckets(symbol string) *symbolBuckets {
@@ -43,76 +32,40 @@ func newSymbolBuckets(symbol string) *symbolBuckets {
 	}
 }
 
-// shardKey hashes the symbol to a shard index.
-func shardKey(symbol string) uint32 {
-	h := fnv.New32a()
-	h.Write([]byte(symbol))
-	return h.Sum32() % numShards
-}
-
-// FlushWorker handles async DB writes on a background goroutine.
-type FlushWorker struct {
-	ch   chan flushTask
-	repo Repository
-}
-
-type flushTask struct {
-	symbol string
-	klines []*model.Kline
-}
-
-func NewFlushWorker(repo Repository, bufferSize int) *FlushWorker {
-	w := &FlushWorker{
-		ch:   make(chan flushTask, bufferSize),
-		repo: repo,
-	}
-	go w.loop()
-	return w
-}
-
-func (w *FlushWorker) loop() {
-	for t := range w.ch {
-		if len(t.klines) > 0 {
-			if err := w.repo.BatchSave(context.Background(), t.symbol, t.klines); err != nil {
-				log.Printf("async flush error: symbol=%s err=%v", t.symbol, err)
-			}
-		}
-	}
-}
-
-func (w *FlushWorker) Enqueue(symbol string, klines []*model.Kline) {
-	select {
-	case w.ch <- flushTask{symbol: symbol, klines: klines}:
-	default:
-		log.Printf("async flush channel full, dropping %d klines for %s", len(klines), symbol)
-	}
-}
-
-func (w *FlushWorker) Close() { close(w.ch) }
-
 // Aggregator consumes trades and produces completed klines.
+// Each symbol gets its own lock — no shard collisions, no hash conflicts.
 type Aggregator struct {
-	repo      Repository
-	flush     *FlushWorker
-	shards    [numShards]*shard
+	repo    Repository
+	symbols sync.Map // map[string]*symbolBuckets
 
 	checkpointCancel context.CancelFunc
 	isLeader         func() bool
+
+	dirtyMu   sync.Mutex
+	dirty     map[string]struct{} // symbols updated since last DrainDirty
 }
 
 // NewAggregator creates an aggregator.
 func NewAggregator(repo Repository) *Aggregator {
-	a := &Aggregator{
-		repo: repo,
+	return &Aggregator{
+		repo:  repo,
+		dirty: make(map[string]struct{}),
 	}
-	for i := range a.shards {
-		a.shards[i] = newShard()
-	}
-	return a
 }
 
-// SetFlushWorker attaches an async DB writer (nil = synchronous writes).
-func (a *Aggregator) SetFlushWorker(w *FlushWorker) { a.flush = w }
+// DrainDirty returns and clears the set of symbols that have received trades
+// since the last call. Used by the continuity checker to avoid scanning
+// all symbols — only recently active symbols need checking.
+func (a *Aggregator) DrainDirty() []string {
+	a.dirtyMu.Lock()
+	defer a.dirtyMu.Unlock()
+	out := make([]string, 0, len(a.dirty))
+	for sym := range a.dirty {
+		out = append(out, sym)
+	}
+	a.dirty = make(map[string]struct{})
+	return out
+}
 
 // SetLeaderChecker registers a callback to determine if this instance
 // should persist klines to the database. Only the leader writes.
@@ -123,37 +76,45 @@ func (a *Aggregator) shouldWrite() bool {
 }
 
 // ProcessTrade updates all kline intervals for the trade's symbol.
-// Completed klines are flushed asynchronously.
+// Completed klines are flushed synchronously (blocking) to ensure no data
+// loss on leader failover.
 func (a *Aggregator) ProcessTrade(ctx context.Context, trade model.Trade) error {
+	start := time.Now()
+	metrics.TradesTotal.WithLabelValues(trade.Symbol).Inc()
+
+	// Mark symbol as dirty for the continuity checker.
+	a.dirtyMu.Lock()
+	a.dirty[trade.Symbol] = struct{}{}
+	a.dirtyMu.Unlock()
+
 	t := time.UnixMilli(trade.Timestamp).UTC()
 	completed := a.updateBuckets(ctx, trade, t)
-	if a.shouldWrite() && len(completed) > 0 {
-		if a.flush != nil {
-			a.flush.Enqueue(trade.Symbol, completed)
-		} else {
-			if err := a.repo.BatchSave(ctx, trade.Symbol, completed); err != nil {
-				return err
-			}
+
+	metrics.ProcessingDuration.WithLabelValues(trade.Symbol).Observe(time.Since(start).Seconds())
+
+	if len(completed) > 0 && a.shouldWrite() {
+		for _, k := range completed {
+			metrics.KlinesWrittenTotal.WithLabelValues(k.Interval).Inc()
+		}
+		if err := a.repo.BatchSave(ctx, trade.Symbol, completed); err != nil {
+			return err
 		}
 	}
 	return nil
 }
 
 func (a *Aggregator) updateBuckets(ctx context.Context, trade model.Trade, t time.Time) []*model.Kline {
-	s := a.shards[shardKey(trade.Symbol)]
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	sb, ok := s.buckets[trade.Symbol]
-	if !ok {
-		sb = newSymbolBuckets(trade.Symbol)
-		s.buckets[trade.Symbol] = sb
-		// Try recovery outside symbolBuckets.mu to avoid nested lock.
-		a.recoverLocked(ctx, sb, trade.Symbol, t)
-	}
+	// LoadOrStore — creates a new symbolBuckets on first trade for this symbol.
+	sbRaw, _ := a.symbols.LoadOrStore(trade.Symbol, newSymbolBuckets(trade.Symbol))
+	sb := sbRaw.(*symbolBuckets)
 
 	sb.mu.Lock()
 	defer sb.mu.Unlock()
+
+	// Recovery on first trade (data loaded the first time sb.data is empty).
+	if len(sb.data) == 0 {
+		a.recoverLocked(ctx, sb, trade.Symbol, t)
+	}
 
 	var completed []*model.Kline
 	for _, iv := range Intervals {
@@ -180,7 +141,7 @@ func (a *Aggregator) updateBuckets(ctx context.Context, trade model.Trade, t tim
 }
 
 // recoverLocked loads checkpoint data from the DB into the symbolBuckets.
-// Called once per symbol on first trade. s.mu must NOT be held.
+// Called once per symbol. sb.mu is held.
 func (a *Aggregator) recoverLocked(ctx context.Context, sb *symbolBuckets, symbol string, t time.Time) {
 	for _, iv := range Intervals {
 		startMs := iv.AlignFn(t).UnixMilli()
@@ -190,9 +151,7 @@ func (a *Aggregator) recoverLocked(ctx context.Context, sb *symbolBuckets, symbo
 			continue
 		}
 		if k != nil {
-			sb.mu.Lock()
 			sb.data[iv.Name] = k
-			sb.mu.Unlock()
 			log.Printf("recovered bucket: symbol=%s interval=%s start=%d trades=%d",
 				symbol, iv.Name, startMs, k.TradeCount)
 		}
@@ -232,54 +191,60 @@ func (a *Aggregator) checkpoint(ctx context.Context) {
 	if !a.shouldWrite() {
 		return
 	}
+	start := time.Now()
 
-	// Iterate all shards, collecting non-empty buckets.
 	type entry struct {
 		symbol string
 		klines []*model.Kline
 	}
 	var batch []entry
+	totalKlines := 0
 
-	for i := range a.shards {
-		s := a.shards[i]
-		s.mu.Lock()
-		for sym, sb := range s.buckets {
-			sb.mu.Lock()
-			var toSave []*model.Kline
-			for _, k := range sb.data {
-				if k != nil && k.TradeCount > 0 {
-					toSave = append(toSave, k)
-				}
+	// sync.Map.Range iterates all symbols. Each symbol has its own lock —
+	// taking sb.mu here only blocks trades for that specific symbol.
+	a.symbols.Range(func(key, value interface{}) bool {
+		symbol := key.(string)
+		sb := value.(*symbolBuckets)
+
+		sb.mu.Lock()
+		var toSave []*model.Kline
+		for _, k := range sb.data {
+			if k != nil && k.TradeCount > 0 {
+				toSave = append(toSave, k)
 			}
-			sb.mu.Unlock()
-			if len(toSave) > 0 {
-				batch = append(batch, entry{sym, toSave})
+			if k != nil {
+				metrics.SymbolBuckets.
+					WithLabelValues(symbol, k.Interval).
+					Set(float64(k.TradeCount))
 			}
 		}
-		s.mu.Unlock()
-	}
+		sb.mu.Unlock()
+
+		if len(toSave) > 0 {
+			batch = append(batch, entry{symbol, toSave})
+			totalKlines += len(toSave)
+		}
+		return true
+	})
+
+	metrics.CheckpointKlines.Observe(float64(totalKlines))
 
 	for _, e := range batch {
-		if a.flush != nil {
-			a.flush.Enqueue(e.symbol, e.klines)
-		} else {
-			if err := a.repo.BatchSave(ctx, e.symbol, e.klines); err != nil {
-				log.Printf("checkpoint error: symbol=%s err=%v", e.symbol, err)
-			}
+		if err := a.repo.BatchSave(ctx, e.symbol, e.klines); err != nil {
+			log.Printf("checkpoint error: symbol=%s err=%v", e.symbol, err)
 		}
 	}
+
+	metrics.CheckpointDuration.Observe(time.Since(start).Seconds())
 }
 
 // Snapshot returns all currently open klines for a symbol (debugging).
 func (a *Aggregator) Snapshot(symbol string) map[string]*model.Kline {
-	s := a.shards[shardKey(symbol)]
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	sb, ok := s.buckets[symbol]
+	sbRaw, ok := a.symbols.Load(symbol)
 	if !ok {
 		return nil
 	}
+	sb := sbRaw.(*symbolBuckets)
 	sb.mu.Lock()
 	defer sb.mu.Unlock()
 
@@ -299,30 +264,20 @@ func (a *Aggregator) Close(ctx context.Context) error {
 		return nil
 	}
 
-	for i := range a.shards {
-		s := a.shards[i]
-		s.mu.Lock()
-		for sym, sb := range s.buckets {
-			sb.mu.Lock()
-			for _, k := range sb.data {
-				if k != nil && k.TradeCount > 0 {
-					if a.flush != nil {
-						a.flush.Enqueue(sym, []*model.Kline{k})
-					} else {
-						if err := a.repo.BatchSave(ctx, sym, []*model.Kline{k}); err != nil {
-							log.Printf("flush error on close: %v", err)
-						}
-					}
+	a.symbols.Range(func(key, value interface{}) bool {
+		symbol := key.(string)
+		sb := value.(*symbolBuckets)
+
+		sb.mu.Lock()
+		for _, k := range sb.data {
+			if k != nil && k.TradeCount > 0 {
+				if err := a.repo.BatchSave(ctx, symbol, []*model.Kline{k}); err != nil {
+					log.Printf("flush error on close: %v", err)
 				}
 			}
-			sb.mu.Unlock()
 		}
-		s.mu.Unlock()
-	}
-
-	if a.flush != nil {
-		// Give flush worker time to drain.
-		time.Sleep(500 * time.Millisecond)
-	}
+		sb.mu.Unlock()
+		return true
+	})
 	return nil
 }
