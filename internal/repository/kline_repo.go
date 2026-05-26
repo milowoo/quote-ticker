@@ -12,22 +12,25 @@ import (
 )
 
 // KlineRepo implements kline.Repository backed by TiDB + in-memory cache.
+// Uses separate read/write pools to prevent checkpoint writes from starving
+// HTTP queries (and vice versa).
 type KlineRepo struct {
-	db    *sql.DB
-	tm    *TableManager
-	cache *klineCache
+	writeDB *sql.DB // BatchSave (checkpoint + completed klines)
+	readDB  *sql.DB // Query + LoadKline (HTTP + recovery)
+	tm      *TableManager
+	cache   *klineCache
 }
 
 // NewKlineRepo creates a KlineRepo.
-//   - maxCacheItems: max recent klines per (symbol, interval) key
-//   - intervalTTL:     per-interval TTL overrides, e.g. {"1m": 2*time.Second}
-//   - defaultCacheTTL: fallback TTL for intervals not in intervalTTL
-func NewKlineRepo(db *sql.DB, tm *TableManager, maxCacheItems int,
+//   - writeDB: connection pool for writes (MaxOpenConns ~10)
+//   - readDB:  connection pool for reads (MaxOpenConns ~40)
+func NewKlineRepo(writeDB, readDB *sql.DB, tm *TableManager, maxCacheItems int,
 	intervalTTL map[string]time.Duration, defaultCacheTTL time.Duration) (*KlineRepo, error) {
 	return &KlineRepo{
-		db:    db,
-		tm:    tm,
-		cache: newKlineCache(maxCacheItems, intervalTTL, defaultCacheTTL),
+		writeDB: writeDB,
+		readDB:  readDB,
+		tm:      tm,
+		cache:   newKlineCache(maxCacheItems, intervalTTL, defaultCacheTTL),
 	}, nil
 }
 
@@ -42,7 +45,7 @@ func (r *KlineRepo) BatchSave(ctx context.Context, symbol string, klines []*mode
 	}
 
 	tableName := TableName(symbol)
-	tx, err := r.db.BeginTx(ctx, nil)
+	tx, err := r.writeDB.BeginTx(ctx, nil)
 	if err != nil {
 		return fmt.Errorf("begin tx: %w", err)
 	}
@@ -98,7 +101,7 @@ func (r *KlineRepo) LoadKline(ctx context.Context, symbol, interval string, star
 	var volS, amtS string
 	var bvS, bqS, wavgS string
 
-	err := r.db.QueryRowContext(ctx, fmt.Sprintf(`
+	err := r.readDB.QueryRowContext(ctx, fmt.Sprintf(`
 		SELECT iv,st,ct,o,h,l,c,v,q,n,bv,bq,wavg
 		FROM %s WHERE iv=? AND st=?`, tableName), interval, startTime).Scan(
 		&k.Interval, &k.StartTime, &k.CloseTime,
@@ -142,7 +145,7 @@ func (r *KlineRepo) Query(ctx context.Context, symbol, interval string,
 
 	// Slow path: query TiDB.
 	tableName := TableName(symbol)
-	rows, err := r.db.QueryContext(ctx, fmt.Sprintf(`
+	rows, err := r.readDB.QueryContext(ctx, fmt.Sprintf(`
 		SELECT iv,st,ct,o,h,l,c,v,q,n,bv,bq,wavg
 		FROM %s
 		WHERE iv = ? AND st >= ? AND st < ?

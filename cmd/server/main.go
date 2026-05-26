@@ -35,19 +35,32 @@ func main() {
 		cfg = config.Default()
 	}
 
-	// --- Database ---
-	db, err := sql.Open("mysql", cfg.Database.DSN)
+	// --- Database (read/write pool separation) ---
+	// Write pool: used by checkpoint + completed kline writes (low concurrency).
+	writeDB, err := sql.Open("mysql", cfg.Database.DSN)
 	if err != nil {
-		log.Fatalf("open db: %v", err)
+		log.Fatalf("open write db: %v", err)
 	}
-	db.SetMaxOpenConns(20)
-	db.SetMaxIdleConns(5)
-	db.SetConnMaxLifetime(5 * time.Minute)
+	writeDB.SetMaxOpenConns(10)
+	writeDB.SetMaxIdleConns(3)
+	writeDB.SetConnMaxLifetime(5 * time.Minute)
 
-	if err := db.Ping(); err != nil {
-		log.Fatalf("db ping: %v", err)
+	// Read pool: used by HTTP queries + recovery LoadKline (high concurrency).
+	readDB, err := sql.Open("mysql", cfg.Database.DSN)
+	if err != nil {
+		log.Fatalf("open read db: %v", err)
 	}
-	log.Println("database connected")
+	readDB.SetMaxOpenConns(40)
+	readDB.SetMaxIdleConns(10)
+	readDB.SetConnMaxLifetime(5 * time.Minute)
+
+	if err := writeDB.Ping(); err != nil {
+		log.Fatalf("write db ping: %v", err)
+	}
+	if err := readDB.Ping(); err != nil {
+		log.Fatalf("read db ping: %v", err)
+	}
+	log.Println("database connected (write=10, read=40)")
 
 	// --- Context (used by checkpoint + Kafka + HTTP + elector) ---
 	ctx, cancel := context.WithCancel(context.Background())
@@ -62,11 +75,11 @@ func main() {
 	}()
 
 	// --- Repository ---
-	tm := repository.NewTableManager(db)
+	tm := repository.NewTableManager(writeDB)
 	intervalTTL := map[string]time.Duration{
 		"1m": 2 * time.Second,
 	}
-	repo, err := repository.NewKlineRepo(db, tm, 500, intervalTTL, 5*time.Second)
+	repo, err := repository.NewKlineRepo(writeDB, readDB, tm, 500, intervalTTL, 5*time.Second)
 	if err != nil {
 		log.Fatalf("new repo: %v", err)
 	}
@@ -185,7 +198,8 @@ func main() {
 	if elect != nil {
 		elect.Close()
 	}
-	db.Close()
+	writeDB.Close()
+	readDB.Close()
 
 	log.Println("shutdown complete")
 }
