@@ -11,6 +11,8 @@ import (
 	"github.com/gorilla/websocket"
 	"quote-ticker/internal/metrics"
 	"quote-ticker/internal/model"
+	"quote-ticker/internal/model/pb"
+	"google.golang.org/protobuf/proto"
 )
 
 var upgrader = websocket.Upgrader{
@@ -130,10 +132,19 @@ func (h *Hub) ensureBroadcaster(symbol string) chan model.Trade {
 // to all writers in parallel.
 func (h *Hub) broadcastLoop(symbol string, ch <-chan model.Trade) {
 	for trade := range ch {
-		buf, err := json.Marshal(map[string]interface{}{
-			"type": "trade",
-			"data": trade,
-		})
+		tSide := "SELL"
+		if trade.TakerBuy {
+			tSide = "BUY"
+		}
+		tick := &pb.PbTradeTick{
+			SymbolId:  trade.Symbol,
+			TradeId:   trade.TradeID,
+			Price:     trade.Price.Trimmed(),
+			Quantity:  trade.Quantity.Trimmed(),
+			TradeTime: trade.Timestamp,
+			TakerSide: tSide,
+		}
+		buf, err := proto.Marshal(tick)
 		if err != nil {
 			continue
 		}
