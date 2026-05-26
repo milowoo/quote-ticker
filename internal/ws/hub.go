@@ -95,6 +95,10 @@ type Hub struct {
 
 	// Parallel fan-out writers.
 	writers []*writer
+
+	// Global subscription counter (aggregated across all writers).
+	subTotalMu sync.Mutex
+	subTotal   map[string]int64 // symbol → total subscribers across all writers
 }
 
 // NewHub creates a hub with 16 parallel writers.
@@ -103,6 +107,7 @@ func NewHub() *Hub {
 		conns:          make(map[*conn]bool),
 		broadcastChans: make(map[string]chan model.Trade),
 		writers:        make([]*writer, 16),
+		subTotal:       make(map[string]int64),
 	}
 	for i := range h.writers {
 		h.writers[i] = newWriter(i)
@@ -183,7 +188,10 @@ func (h *Hub) subscribe(c *conn, symbol string) {
 	w.mu.Unlock()
 	c.subbed[symbol] = true
 
-	metrics.WSSubscriptions.WithLabelValues(symbol).Set(float64(len(w.subs[symbol])))
+	h.subTotalMu.Lock()
+	h.subTotal[symbol]++
+	metrics.WSSubscriptions.WithLabelValues(symbol).Set(float64(h.subTotal[symbol]))
+	h.subTotalMu.Unlock()
 }
 
 // unsubscribe removes symbol from conn's subscription.
@@ -194,29 +202,42 @@ func (h *Hub) unsubscribe(c *conn, symbol string) {
 		delete(subs, c)
 		if len(subs) == 0 {
 			delete(w.subs, symbol)
-			metrics.WSSubscriptions.DeleteLabelValues(symbol)
-			w.mu.Unlock()
-			delete(c.subbed, symbol)
-			return
 		}
-		metrics.WSSubscriptions.WithLabelValues(symbol).Set(float64(len(subs)))
 	}
 	w.mu.Unlock()
 	delete(c.subbed, symbol)
+
+	h.subTotalMu.Lock()
+	h.subTotal[symbol]--
+	if h.subTotal[symbol] <= 0 {
+		delete(h.subTotal, symbol)
+		metrics.WSSubscriptions.DeleteLabelValues(symbol)
+	} else {
+		metrics.WSSubscriptions.WithLabelValues(symbol).Set(float64(h.subTotal[symbol]))
+	}
+	h.subTotalMu.Unlock()
 }
 
 // removeConn cleans up all subscriptions for a disconnected client.
 func (h *Hub) removeConn(c *conn) {
+	h.subTotalMu.Lock()
 	w := c.writer
 	w.mu.Lock()
 	for sym := range c.subbed {
 		delete(w.subs[sym], c)
 		if len(w.subs[sym]) == 0 {
 			delete(w.subs, sym)
+		}
+		h.subTotal[sym]--
+		if h.subTotal[sym] <= 0 {
+			delete(h.subTotal, sym)
 			metrics.WSSubscriptions.DeleteLabelValues(sym)
+		} else {
+			metrics.WSSubscriptions.WithLabelValues(sym).Set(float64(h.subTotal[sym]))
 		}
 	}
 	w.mu.Unlock()
+	h.subTotalMu.Unlock()
 
 	h.mu.Lock()
 	delete(h.conns, c)

@@ -17,9 +17,9 @@
 │                    quote-ticker (Go Service)                  │
 │                                                              │
 │  ┌──────────┐   ┌───────────┐   ┌──────────────────────┐    │
-│  │  Kafka   │──▶│  Kline    │──▶│  Asnyc Flush Worker  │───▶│──▶ TiDB
-│  │ Consumer │   │Aggregator │   │  (goroutine pool)    │    │   (t_kline_{symbol})
-│  │(N workers)│  │(64 shards)│   └──────────────────────┘    │
+│  │  Kafka   │──▶│  Kline    │──▶│  async completed buf  │───▶│──▶ TiDB
+│  │ Consumer │   │Aggregator │   │  + checkpoint 500ms   │    │   (t_kline_{symbol})
+│  │(N workers)│  │(sync.Map) │   └──────────────────────┘    │
 │  └──────────┘   └─────┬─────┘                                │
 │                        │                                      │
 │                        ▼                                      │
@@ -66,27 +66,24 @@ Kafka Consumer Worker Pool (config.parallel 个 goroutine)     ← internal/kafk
        │
        ├→ agg.ProcessTrade(ctx, trade)        ← internal/kline/aggregator.go
        │    │
-       │    ├── shard[fnv32(symbol) % 64].Lock()    ← 64 分片锁，不同 symbol 完全并行
-       │    │    └── 首次则为该 symbol 执行 recoverLocked (从 TiDB 读 checkpoint)
+       │    ├── sync.Map.LoadOrStore(symbol)       ← 每个 symbol 独立锁，零冲突
+       │    │    └── 首次为该 symbol 执行 recoverLocked (从 TiDB 读 checkpoint)
        │    │
        │    ├── for 7 intervals (1m/10m/30m/1h/1w/1mon/1y):
        │    │    ├── iv.AlignFn(t) 计算当前窗口起始时间
        │    │    ├── cur.Update(price, qty, amount)  ← 更新 OHLCV
        │    │    │    └── 纯 int64 定点数运算，零 heap alloc
-       │    │    └── 窗口关闭 ? → 标记为 completed kline
+       │    │    └── 窗口关闭 ? → 标记为 completed kline → 入 completedBuf
        │    │
-       │    └── completed > 0 ?
-       │         └── flushWorker.Enqueue(symbol, klines)
-       │              └── 后台 goroutine 执行 BatchSave → TiDB (REPLACE INTO t_kline_{symbol})
-       │                   └── k.ComputeAvg()  ← 加权平均在 flush 时计算，非每笔
+       │    └── completedBuf + checkpoint 合并 → 并行 BatchSave (8 路)
+       │         └── k.ComputeAvg()  ← 加权平均在 flush 时计算，非每笔
        │
        └→ hub.BroadcastTrade(trade)              ← internal/ws/hub.go
             │
-            └── ensureBroadcaster(symbol) → per-symbol channel (buf 256)
+            └── ensureBroadcaster(symbol) → per-symbol channel (buf 1024)
                  └── broadcastLoop goroutine (每个 symbol 独立)
-                      ├── json.Marshal(trade)   ← 一次 marshal，多连接共享
-                      └── for each subscriber:
-                           └── c.send <- buf    ← 慢消费者 drop，不阻塞
+                      ├── proto.Marshal(trade)   ← protobuf 序列化
+                      └── 16 路并行 writer → writer subs → c.send <- buf
 ```
 
 ### WebSocket 推送
@@ -105,7 +102,7 @@ Kafka Consumer Worker Pool (config.parallel 个 goroutine)     ← internal/kafk
        └→ trade → per-symbol chan("BTCUSDT")
             │
             └→ broadcastLoop goroutine (per-symbol, 独立 goroutine)
-                 ├── json.Marshal({"type":"trade","data":{...}})
+                 ├── proto.Marshal(tick)  ← protobuf 二进制
                  └── for each subscriber:
                       ├── c.send <- buf (非阻塞)
                       └── writePump → conn.ws.WriteMessage
@@ -117,7 +114,7 @@ Kafka Consumer Worker Pool (config.parallel 个 goroutine)     ← internal/kafk
 服务启动 (cmd/server/main.go)
   │
   ├── db.Ping()
-  ├── agg.StartCheckpoint(ctx, 5s)              ← 每 5s 持久化 open bucket
+  ├── agg.StartCheckpoint(ctx, 500ms)           ← 每 500ms 持久化 open bucket
   ├── (可选) elect.Run(ctx)                      ← etcd 选主
   ├── consumer.Run(ctx)                          ← 开始消费 Kafka
   │
@@ -150,27 +147,27 @@ Kafka Consumer Worker Pool (config.parallel 个 goroutine)     ← internal/kafk
 | 乘法 | heap alloc | `a*b/Scale`（大数回退 big.Int） |
 | 每笔 GC | 21 次 heap alloc | **0 次** |
 
-### 2. Per-Symbol 分片锁
+### 2. Per-Symbol 独立锁（零冲突）
 
 ```go
-const numShards = 64
-shard[fnv32(symbol) % numShards]  // 独立 sync.Mutex
+sbRaw, _ := a.symbols.LoadOrStore(symbol, newSymbolBuckets(symbol))
+sb := sbRaw.(*symbolBuckets)
+sb.mu.Lock()
 ```
 
-- 不同交易对完全不互斥
-- 500 交易对 × 10 TPS 时无锁竞争
+- 每个 symbol 独占一个 `sync.Mutex`，hash 冲突概率为零
+- 通过 `sync.Map` 管理 symbol 生命周期，首次到达时自动创建
 
-### 3. 异步 DB Flush
+### 3. Completed Kline 缓冲 + Checkpoint 合并写入
 
-Trade 处理与 DB 写入解耦：
 ```
-ProcessTrade → 只更新内存桶 + 入队 flush channel
-FlushWorker → 后台 goroutine 批量 BatchSave
+ProcessTrade → 只更新内存桶 + 入 completedBuf (不等待 DB)
+Checkpoint(500ms) → completedBuf + open bucket 合并 → 并行 BatchSave (8 路)
 ```
 
-- 生产端永不等待 DB
-- Buffer 10000，满时 log 告警但不阻塞
-- 关闭时 drain 500ms 保证最终写入
+- Trade 处理永不等待 DB 写入
+- Completed kline 与 checkpoint 合并为同一批写入，减少 TiDB 事务数
+- 关闭时 final flush 保证数据完整
 
 ### 4. Kafka 多 Worker
 
@@ -183,11 +180,11 @@ reader goroutine → chan → worker 1
 - 适合多 partition topic
 - 处理与 fetch/commit 分离
 
-### 5. WebSocket Per-Symbol Fan-out
+### 5. WebSocket 16 路并行 Writer
 
-每个 symbol 一个独立 goroutine：
-- JSON 一次 marshal，多连接共享
-- BroadcastTrade 非阻塞（drop 慢消费者）
+每个 symbol 一个独立 goroutine（marshal）+ 16 个 writer goroutine（fan-out）：
+- `proto.Marshal` 序列化为二进制
+- 16 路 writer 并行推送，10K 订阅者 ~31µs
 - 不同 symbol 互不影响
 
 ---
@@ -209,23 +206,24 @@ Kafka message → proto.Unmarshal
                                  → dedup 拦截，不会重复计入 K 线
 ```
 
-- 使用 ring buffer 记录最近 100 万条 TradeID（≈ 16MB，覆盖 ~5 分钟窗口）
-- 超出窗口的旧 ID 自动淘汰，不影响高频交易
-- 滑窗大小超过 Kafka rebalance 时间窗口，确保 rebalance 期间的重复消息被拦截
+- 使用 `go-cache` 记录 TradeID，TTL = 5 分钟
+- 无需手动管理 ring buffer，go-cache janitor 自动清理过期条目
+- TTL 超过 Kafka rebalance 时间窗口，确保 rebalance 期间的重复消息被拦截
 
 ### 2. Periodic Checkpoint（防 Crash 丢失）
 
 ```
-每 5 秒 → 遍历所有 shard → 收集非空 bucket → REPLACE INTO 写入 TiDB
+每 500ms → sync.Map.Range 遍历所有 symbol → 收集非空 bucket + completedBuf
+        → 8 路并行 BatchSave → REPLACE INTO 写入 TiDB
 ```
 
 | 场景 | 结果 |
 |------|------|
-| 实例 crash | 最多丢 5 秒的 open kline 数据 |
+| 实例 crash | 最多丢 500ms 的 open kline 数据 |
 | 窗口关闭时 crash | REPLACE INTO 覆盖旧 checkpoint |
 | 无数据时 crash | TradeCount==0 跳过，不写空行 |
 
-### 2. 重启恢复
+### 3. 重启恢复
 
 首个 Trade 到达某交易对时自动恢复：
 ```
@@ -236,7 +234,7 @@ recoverLocked:
     未命中 → 从零开始
 ```
 
-### 3. Continuity Check（后台数据一致性校验）
+### 4. Continuity Check（后台数据一致性校验）
 
 Leader 实例上每 10 分钟运行：
 
@@ -252,14 +250,13 @@ Leader 实例上每 10 分钟运行：
   → BatchSave → REPLACE INTO
 ```
 
-### 4. Final Flush on Shutdown
+### 5. Final Flush on Shutdown
 
 收到 SIGINT/SIGTERM 时：
-1. 取消 checkpoint goroutine
-2. 遍历所有 shard 的所有 open bucket
-3. 非空 bucket 入队 flush worker
-4. 等待 500ms drain
-5. 关闭连接
+1. 取消 checkpoint goroutine + stale checker
+2. 刷新 completedBuf 中所有缓冲的 completed kline
+3. sync.Map.Range 遍历所有 open bucket → 同步 BatchSave
+4. 关闭 etcd 连接、Kafka reader、TiDB 连接池
 
 ---
 
@@ -362,12 +359,12 @@ CREATE TABLE IF NOT EXISTS t_kline_btcusdt (
 ### WebSocket 订阅
 
 ```json
-// 请求
+// 请求（JSON 控制消息）
 {"action": "subscribe", "symbol": "BTCUSDT"}
 {"action": "unsubscribe", "symbol": "BTCUSDT"}
 
-// 推送
-{"type": "trade", "data": {"Symbol":"BTCUSDT","TradeID":12345,...}}
+// 推送（protobuf 二进制，PbTradeTick）
+// 客户端需解析 protobuf 格式
 ```
 
 ---
@@ -419,6 +416,11 @@ continuity:
 | `quote_ticker_leader` | Gauge | — | 1=Leader, 0=Follower |
 | `quote_ticker_checkpoint_duration_seconds` | Histogram | — | 一次 checkpoint flush 耗时（100µs~1.6s） |
 | `quote_ticker_checkpoint_klines` | Summary | — | 每次 checkpoint 写入的 kline 数 |
+| `quote_ticker_trade_age_seconds` | Gauge | `symbol` | 距交易对最后一笔成交的秒数（用于数据新鲜度告警） |
+| `quote_ticker_stale_alerts_total` | Counter | `symbol` | 超过静默阈值的告警触发次数 |
+| `quote_ticker_db_batch_save_duration_seconds` | Histogram | `symbol` | BatchSave 写入 TiDB 耗时（100µs~1.6s） |
+| `quote_ticker_db_query_duration_seconds` | Histogram | `symbol`, `interval` | K 线查询 TiDB 耗时（10µs~160ms） |
+| `quote_ticker_db_load_kline_duration_seconds` | Histogram | — | LoadKline 单行 PK 查询耗时（10µs~160ms） |
 
 ### Go Runtime 指标（prometheus/client_golang 内置）
 
@@ -440,6 +442,7 @@ continuity:
 | `go_goroutines > 50000` | Goroutine 泄漏 |
 | `process_resident_memory_bytes > 2e9` | 内存超过 2GB |
 | `rate(checkpoint_duration_seconds_sum[5m]) / rate(checkpoint_duration_seconds_count[5m]) > 1` | Checkpoint 写入过慢 |
+| `quote_ticker_trade_age_seconds > 120` | 交易对超过 2 分钟无成交（撮合引擎异常） |
 
 ---
 
@@ -463,7 +466,8 @@ continuity:
 │   │   └── continuity.go          # 连续性检测 + 补数
 │   ├── repository/
 │   │   ├── table_manager.go        # 自动建表
-│   │   └── kline_repo.go          # TiDB 读写
+│   │   ├── kline_repo.go          # TiDB 读写（读写池分离）
+│   │   └── cache.go               # 内存缓存（go-cache）
 │   ├── kafka/consumer.go           # Kafka 消费 (protobuf)
 │   ├── elector/elector.go          # etcd 选主
 │   ├── ws/hub.go                   # WebSocket 推送
