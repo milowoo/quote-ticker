@@ -32,6 +32,13 @@ func newSymbolBuckets(symbol string) *symbolBuckets {
 	}
 }
 
+// StaleAlertConfig defines the stale-symbol alerting parameters.
+type StaleAlertConfig struct {
+	Enabled    bool
+	Threshold  time.Duration // e.g. 2 * time.Minute
+	CheckEvery time.Duration // how often to scan
+}
+
 // Aggregator consumes trades and produces completed klines.
 // Each symbol gets its own lock — no shard collisions, no hash conflicts.
 type Aggregator struct {
@@ -46,6 +53,10 @@ type Aggregator struct {
 
 	completedMu  sync.Mutex
 	completedBuf map[string][]*model.Kline // completed klines awaiting flush
+
+	lastTrade   sync.Map // map[string]int64 — symbol → last trade unix millis
+	staleCfg    StaleAlertConfig
+	staleCancel context.CancelFunc
 }
 
 // NewAggregator creates an aggregator.
@@ -86,6 +97,9 @@ func (a *Aggregator) shouldWrite() bool {
 func (a *Aggregator) ProcessTrade(ctx context.Context, trade model.Trade) error {
 	start := time.Now()
 	metrics.TradesTotal.WithLabelValues(trade.Symbol).Inc()
+
+	// Track last trade time for stale alert.
+	a.lastTrade.Store(trade.Symbol, trade.Timestamp)
 
 	// Mark symbol as dirty for the continuity checker.
 	a.dirtyMu.Lock()
@@ -171,6 +185,54 @@ func (a *Aggregator) recoverLocked(ctx context.Context, sb *symbolBuckets, symbo
 		}(iv)
 	}
 	wg.Wait()
+}
+
+// StartStaleChecker starts a goroutine that alerts when a symbol has received
+// no trades for longer than cfg.Threshold. Age is exposed as a Prometheus gauge
+// for external alerting (Prometheus Alertmanager), and a counter is incremented
+// on each alert firing for internal tracking.
+func (a *Aggregator) StartStaleChecker(ctx context.Context, cfg StaleAlertConfig) {
+	if !cfg.Enabled || cfg.Threshold <= 0 {
+		return
+	}
+	if cfg.CheckEvery <= 0 {
+		cfg.CheckEvery = cfg.Threshold / 4
+	}
+	a.staleCfg = cfg
+	ctx, a.staleCancel = context.WithCancel(ctx)
+
+	go func() {
+		ticker := time.NewTicker(cfg.CheckEvery)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				a.checkStale()
+			}
+		}
+	}()
+	log.Printf("stale checker started: threshold=%v check=%v", cfg.Threshold, cfg.CheckEvery)
+}
+
+func (a *Aggregator) checkStale() {
+	now := time.Now().UnixMilli()
+	threshMs := a.staleCfg.Threshold.Milliseconds()
+
+	a.lastTrade.Range(func(key, value interface{}) bool {
+		symbol := key.(string)
+		last := value.(int64)
+		age := now - last
+		metrics.TradeAgeSeconds.WithLabelValues(symbol).Set(float64(age) / 1000)
+
+		if age > threshMs {
+			metrics.StaleAlertTotal.WithLabelValues(symbol).Inc()
+			log.Printf("STALE ALERT: symbol=%s lastTrade=%d age=%.1fs threshold=%v",
+				symbol, last, float64(age)/1000, a.staleCfg.Threshold)
+		}
+		return true
+	})
 }
 
 // calcCloseTime returns the close timestamp for the window starting at start.
@@ -296,6 +358,9 @@ func (a *Aggregator) Snapshot(symbol string) map[string]*model.Kline {
 func (a *Aggregator) Close(ctx context.Context) error {
 	if a.checkpointCancel != nil {
 		a.checkpointCancel()
+	}
+	if a.staleCancel != nil {
+		a.staleCancel()
 	}
 	if !a.shouldWrite() {
 		return nil

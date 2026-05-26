@@ -145,6 +145,11 @@ func main() {
 
 	// --- Start checkpoint only if leader check passes.
 	agg.StartCheckpoint(ctx, 500*time.Millisecond)
+	agg.StartStaleChecker(ctx, kline.StaleAlertConfig{
+		Enabled:    true,
+		Threshold:  2 * time.Minute,
+		CheckEvery: 30 * time.Second,
+	})
 
 	// --- Trade handler (dispatches to aggregator + WebSocket) ---
 	tradeHandler := func(ctx context.Context, trade model.Trade) error {

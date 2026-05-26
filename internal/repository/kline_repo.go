@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"quote-ticker/internal/decimal"
+	"quote-ticker/internal/metrics"
 	"quote-ticker/internal/model"
 )
 
@@ -39,6 +40,10 @@ func (r *KlineRepo) BatchSave(ctx context.Context, symbol string, klines []*mode
 	if len(klines) == 0 {
 		return nil
 	}
+	start := time.Now()
+	defer func() {
+		metrics.DbBatchSaveDuration.WithLabelValues(symbol).Observe(time.Since(start).Seconds())
+	}()
 
 	if err := r.tm.EnsureTable(ctx, symbol); err != nil {
 		return err
@@ -94,6 +99,10 @@ func (r *KlineRepo) BatchSave(ctx context.Context, symbol string, klines []*mode
 
 // LoadKline retrieves a single kline by interval + startTime (PK lookup).
 func (r *KlineRepo) LoadKline(ctx context.Context, symbol, interval string, startTime int64) (*model.Kline, error) {
+	defer func(start time.Time) {
+		metrics.DbLoadKlineDuration.Observe(time.Since(start).Seconds())
+	}(time.Now())
+
 	tableName := TableName(symbol)
 
 	var k model.Kline
@@ -144,6 +153,10 @@ func (r *KlineRepo) Query(ctx context.Context, symbol, interval string,
 	}
 
 	// Slow path: query TiDB.
+	queryStart := time.Now()
+	defer func() {
+		metrics.DbQueryDuration.WithLabelValues(symbol, interval).Observe(time.Since(queryStart).Seconds())
+	}()
 	tableName := TableName(symbol)
 	rows, err := r.readDB.QueryContext(ctx, fmt.Sprintf(`
 		SELECT iv,st,ct,o,h,l,c,v,q,n,bv,bq,wavg

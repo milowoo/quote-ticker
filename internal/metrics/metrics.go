@@ -8,6 +8,31 @@ import (
 
 const ns = "quote_ticker"
 
+// ── Database ───────────────────────────────────────────────────────────
+
+var (
+	DbBatchSaveDuration = promauto.NewHistogramVec(prometheus.HistogramOpts{
+		Namespace: ns,
+		Name:      "db_batch_save_duration_seconds",
+		Help:      "Time for one BatchSave call (transaction + REPLACE rows).",
+		Buckets:   prometheus.ExponentialBuckets(1e-4, 4, 8), // 100µs ~ 1.6s
+	}, []string{"symbol"})
+
+	DbQueryDuration = promauto.NewHistogramVec(prometheus.HistogramOpts{
+		Namespace: ns,
+		Name:      "db_query_duration_seconds",
+		Help:      "Time for one Kline query.",
+		Buckets:   prometheus.ExponentialBuckets(1e-5, 4, 8), // 10µs ~ 160ms
+	}, []string{"symbol", "interval"})
+
+	DbLoadKlineDuration = promauto.NewHistogram(prometheus.HistogramOpts{
+		Namespace: ns,
+		Name:      "db_load_kline_duration_seconds",
+		Help:      "Time for one LoadKline (single-row PK lookup).",
+		Buckets:   prometheus.ExponentialBuckets(1e-5, 4, 8),
+	})
+)
+
 // ── Kafka ──────────────────────────────────────────────────────────────
 
 var (
@@ -78,6 +103,22 @@ var (
 		Name:      "leader",
 		Help:      "1 if this instance is the leader, 0 otherwise.",
 	})
+)
+
+// ── Stale Symbol Alert ──────────────────────────────────────────────────
+
+var (
+	TradeAgeSeconds = promauto.NewGaugeVec(prometheus.GaugeOpts{
+		Namespace: ns,
+		Name:      "trade_age_seconds",
+		Help:      "Seconds since last trade per symbol. Used for freshness alerting.",
+	}, []string{"symbol"})
+
+	StaleAlertTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+		Namespace: ns,
+		Name:      "stale_alerts_total",
+		Help:      "Count of stale-symbol alert firings.",
+	}, []string{"symbol"})
 )
 
 // ── Checkpoint ──────────────────────────────────────────────────────────
